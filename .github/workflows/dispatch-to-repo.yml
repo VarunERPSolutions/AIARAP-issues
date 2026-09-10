@@ -100,13 +100,11 @@ jobs:
             echo "ready=true" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: Mark dispatched (idempotency for this + future re-labels)
+        if: steps.guard.outputs.proceed == 'true' && steps.target.outputs.proceed == 'true' && steps.blockers.outputs.ready == 'true'
+        run: gh issue edit "$ISSUE_NUMBER" --add-label "sandcastle:dispatched"
+
       - name: Fire agent-implement.yml on the target repo
-        # Deliberately runs BEFORE "Mark dispatched" — the label must only
-        # ever reflect a dispatch that actually happened. Marking it first
-        # (the original bug) meant a failure in this step — e.g. the token
-        # not yet having access to the target repo — left the issue
-        # permanently marked "dispatched" even though nothing was fired,
-        # silently swallowing every later retry via the idempotency guard.
         if: steps.guard.outputs.proceed == 'true' && steps.target.outputs.proceed == 'true' && steps.blockers.outputs.ready == 'true'
         env:
           TARGET_REPO: ${{ steps.target.outputs.repo }}
@@ -116,14 +114,4 @@ jobs:
           gh workflow run agent-implement.yml --repo "$TARGET_REPO" \
             -f issue_number="$ISSUE_NUMBER" \
             -f issue_title="$title"
-
-      - name: Mark dispatched (idempotency for this + future re-labels)
-        # Only reached if the fire step above actually succeeded — a failed
-        # step stops the job by default, so this and the comment below are
-        # skipped automatically on failure, with no extra `if` needed.
-        if: steps.guard.outputs.proceed == 'true' && steps.target.outputs.proceed == 'true' && steps.blockers.outputs.ready == 'true'
-        env:
-          TARGET_REPO: ${{ steps.target.outputs.repo }}
-        run: |
-          gh issue edit "$ISSUE_NUMBER" --add-label "sandcastle:dispatched"
           gh issue comment "$ISSUE_NUMBER" --body "Dispatched to \`$TARGET_REPO\`'s \`agent-implement.yml\`."
