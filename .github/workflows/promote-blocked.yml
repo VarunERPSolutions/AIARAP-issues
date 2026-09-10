@@ -1,0 +1,89 @@
+name: Sandcastle Promote Blocked
+
+# When an issue closes, re-check every other open, Sandcastle-labeled issue
+# whose body references it via "Blocked by #<closed-number>" — if ALL of
+# that issue's blockers are now closed, add retry:sandcastle to re-trigger
+# dispatch-to-repo.yml. Event-driven (not a poll), same pattern verified in
+# the Sandcastle SDK author's own production repo
+# (mattpocock/course-video-manager's agent-promote-queued.yml), adapted here
+# to this project's text-based "Blocked by #N" convention (to-tickets/
+# to-spec produce that, not GitHub's native sub-issue relation — see the
+# architecture review discussion this workflow implements).
+
+on:
+  issues:
+    types: [closed]
+
+jobs:
+  promote:
+    if: github.event.issue.state_reason != 'not_planned'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      issues: write
+
+    env:
+      CLOSED_NUMBER: ${{ github.event.issue.number }}
+      GH_TOKEN: ${{ secrets.AGENT_PAT }}
+      GH_REPO: ${{ github.repository }}
+
+    steps:
+      - name: Refuse if AGENT_PAT is not configured
+        if: env.GH_TOKEN == ''
+        run: |
+          echo "::error::secrets.AGENT_PAT is not set on this repo."
+          exit 1
+
+      - name: Find open Sandcastle-labeled issues referencing this one as a blocker
+        id: candidates
+        run: |
+          set -euo pipefail
+          open_issues=$(gh issue list --state open --label Sandcastle --limit 200 \
+            --json number,body --jq '.[] | select(.body | test("(?i)blocked by[^\\n]*#'"$CLOSED_NUMBER"'\\b")) | .number')
+          echo "Found candidates: $open_issues"
+          {
+            echo "list<<EOF"
+            echo "$open_issues"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Re-check each candidate's full blocker set; promote if fully unblocked
+        if: steps.candidates.outputs.list != ''
+        env:
+          CANDIDATES: ${{ steps.candidates.outputs.list }}
+        run: |
+          set -euo pipefail
+          echo "$CANDIDATES" | while read -r y; do
+            [ -z "$y" ] && continue
+            echo "::group::Evaluating #$y"
+
+            labels=$(gh issue view "$y" --json labels --jq '[.labels[].name]')
+            already_dispatched=$(echo "$labels" | jq 'index("sandcastle:dispatched") != null')
+            if [ "$already_dispatched" = "true" ]; then
+              echo "Skip: #$y already dispatched (or in flight)."
+              echo "::endgroup::"
+              continue
+            fi
+
+            body=$(gh issue view "$y" --json body --jq '.body')
+            blockers=$(echo "$body" | grep -oiE '\bblocked by[^\n]*' | grep -oE '#[0-9]+' | tr -d '#' | sort -u || true)
+            still_open=""
+            for n in $blockers; do
+              [ "$n" = "$y" ] && continue
+              state=$(gh issue view "$n" --json state --jq '.state' 2>/dev/null || echo "UNKNOWN")
+              if [ "$state" != "CLOSED" ]; then
+                still_open="$still_open #$n"
+              fi
+            done
+
+            if [ -n "$still_open" ]; then
+              echo "Skip: #$y still blocked by:$still_open"
+              echo "::endgroup::"
+              continue
+            fi
+
+            echo "Promote: #$y — all blockers closed, adding retry:sandcastle"
+            gh issue comment "$y" --body "Unblocked by #${CLOSED_NUMBER} closing — all blockers now closed, dispatching."
+            gh issue edit "$y" --add-label "retry:sandcastle"
+            echo "::endgroup::"
+          done
